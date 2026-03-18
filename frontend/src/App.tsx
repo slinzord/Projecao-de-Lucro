@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ProjecaoCultResponse } from './types'
 import './App.css'
 
@@ -43,6 +43,11 @@ function ProjecaoCult() {
   const [error, setError] = useState<string | null>(null)
   const [isSimulacao, setIsSimulacao] = useState(false)
   const [simuladorLigado, setSimuladorLigado] = useState(false)
+  const simuladorLigadoRef = useRef(simuladorLigado)
+  const skipAutoRecalcRef = useRef(true)
+  const debounceRef = useRef<number | null>(null)
+  const abortCtrlRef = useRef<AbortController | null>(null)
+  const recalcIdRef = useRef(0)
   const [realizadoRecolhido, setRealizadoRecolhido] = useState(true)
   const [orcamentoManual, setOrcamentoManual] = useState<string>('') // orçamento total simulação
   const [custoObraManual, setCustoObraManual] = useState<Record<string, string>>({})
@@ -50,7 +55,12 @@ function ProjecaoCult() {
   const [despesaManual, setDespesaManual] = useState<Record<string, string>>({})
   const [focusedInput, setFocusedInput] = useState<string | null>(null)
 
+  useEffect(() => {
+    simuladorLigadoRef.current = simuladorLigado
+  }, [simuladorLigado])
+
   const loadBase = () => {
+    skipAutoRecalcRef.current = true
     setLoading(true)
     setError(null)
     fetch('/api/projecao/cult')
@@ -84,6 +94,7 @@ function ProjecaoCult() {
         setCustoObraManual(custo)
         setVgvManual(vgv)
         setDespesaManual(desp)
+        skipAutoRecalcRef.current = false
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
@@ -94,6 +105,15 @@ function ProjecaoCult() {
   }, [])
 
   const handleRecalcularSimulacao = () => {
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current)
+      debounceRef.current = null
+    }
+    // Cancela requisições anteriores para não “atrasar” o resultado com respostas antigas.
+    abortCtrlRef.current?.abort()
+    const controller = new AbortController()
+    abortCtrlRef.current = controller
+    const recalcId = ++recalcIdRef.current
     const payload: { orcamento_total?: number; custo_obra_mes?: Record<string, number>; vgv_mes?: Record<string, number>; despesa_mes?: Record<string, number> } = {}
     const orc = parsePtBrNumber(orcamentoManual)
     if (!Number.isNaN(orc)) payload.orcamento_total = orc
@@ -121,6 +141,7 @@ function ProjecaoCult() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     })
       .then(async (res) => {
         if (!res.ok) {
@@ -135,11 +156,37 @@ function ProjecaoCult() {
         }
         return res.json()
       })
-      .then(setData)
-      .then(() => setIsSimulacao(true))
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false))
+      .then((d) => {
+        if (recalcIdRef.current === recalcId) setData(d)
+      })
+      .then(() => {
+        if (recalcIdRef.current === recalcId) setIsSimulacao(true)
+      })
+      .catch((e) => {
+        if (e?.name === 'AbortError') return
+        if (recalcIdRef.current === recalcId) setError(e.message)
+      })
+      .finally(() => {
+        if (recalcIdRef.current === recalcId) setLoading(false)
+      })
   }
+
+  // UX: ao editar qualquer premissa da simulação, recalculamos automaticamente (debounce)
+  // para o "Resultado (Sim)" refletir as mudanças sem exigir clicar no botão.
+  useEffect(() => {
+    if (!simuladorLigadoRef.current) return
+    if (skipAutoRecalcRef.current) return
+    if (debounceRef.current) window.clearTimeout(debounceRef.current)
+
+    debounceRef.current = window.setTimeout(() => {
+      handleRecalcularSimulacao()
+    }, 200)
+
+    return () => {
+      if (debounceRef.current) window.clearTimeout(debounceRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orcamentoManual, custoObraManual, vgvManual, despesaManual])
 
   if (loading && !data) {
     return <div className="loading">Carregando projeção...</div>
@@ -170,6 +217,14 @@ function ProjecaoCult() {
     ...realizadoVisivel.map((r) => ({ ...r, isRealizado: true })),
     ...projecao.map((r) => ({ ...r, isRealizado: false })),
   ]
+
+  const EPS = 1e-6
+  const orcamentoBase = base.orcamento_total ?? baseRef.base.orcamento_total ?? 0
+  const mesEstouroDate = projecao.find(
+    (r) => r.orcamento_total != null && r.orcamento_total > orcamentoBase + EPS,
+  )?.metric_date
+
+  const mesPoc100Date = projecao.find((r) => r.poc != null && r.poc >= 1 - 1e-9)?.metric_date
 
   const baseProjPorMes = new Map((baseRef.projecao || []).map((r) => [r.metric_date, r]))
 
@@ -283,22 +338,22 @@ function ProjecaoCult() {
         <table className="tabela-projecao">
           <thead>
             <tr>
-              <th>Tipo</th>
-              <th>Mês</th>
+              <th className="col-tipo">Tipo</th>
+              <th className="col-mes">Mês</th>
               <th className="num">Orçamento</th>
-              <th>POC</th>
+              <th className="num">POC</th>
               {simuladorLigado ? (
                 <>
                   <th className="num th-base">Custo obra (Base)</th>
                   <th className="num th-sim">Custo obra (Sim)</th>
                   <th className="num th-base">VGV mês (Base)</th>
                   <th className="num th-sim">VGV mês (Sim)</th>
-                  <th className="num th-base">Despesa (Base)</th>
-                  <th className="num th-sim">Despesa (Sim)</th>
                   <th className="num th-base">VGV % (Base)</th>
                   <th className="num th-sim">VGV % (Sim)</th>
                   <th className="num th-base">% vendido (Base)</th>
                   <th className="num th-sim">% vendido (Sim)</th>
+                  <th className="num th-base">Despesa (Base)</th>
+                  <th className="num th-sim">Despesa (Sim)</th>
                   <th className="num th-base">Receita mês (Base)</th>
                   <th className="num th-sim">Receita mês (Sim)</th>
                   <th className="num th-base">Custo (Base)</th>
@@ -310,9 +365,9 @@ function ProjecaoCult() {
                 <>
                   <th className="num">Custo obra</th>
                   <th className="num">VGV mês</th>
-                  <th className="num">Despesas</th>
                   <th className="num">VGV %</th>
                   <th className="num">% vendido</th>
+                  <th className="num">Despesas</th>
                   <th className="num">Receita mês</th>
                   <th className="num">Custo</th>
                   <th className="num">Resultado</th>
@@ -324,24 +379,36 @@ function ProjecaoCult() {
           <tbody>
             {realizadoRecolhido && realizadoOcultos > 0 && (
               <tr className="row-recolhido">
-                <td colSpan={simuladorLigado ? 20 : 13}>… {realizadoOcultos} meses de realizado (expandir acima)</td>
+                <td colSpan={simuladorLigado ? 21 : 13}>… {realizadoOcultos} meses de realizado (expandir acima)</td>
               </tr>
             )}
             {linhas.map((r) => {
               const isUltimoRealizado = r.isRealizado && r.metric_date === dataBase
+              const isEstouroLinha = !r.isRealizado && mesEstouroDate != null && r.metric_date === mesEstouroDate
+              const isPoc100Linha = !r.isRealizado && mesPoc100Date != null && r.metric_date === mesPoc100Date
+              const trClassName = [
+                isUltimoRealizado ? 'ultimo-realizado' : '',
+                isEstouroLinha ? 'linha-estouro' : '',
+                isPoc100Linha ? 'linha-poc100' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')
               const baseLinha = r.isRealizado ? null : (baseProjPorMes.get(r.metric_date) ?? null)
               return (
-                <tr key={`${r.metric_date}-${r.isRealizado ? 'r' : 'p'}`} className={isUltimoRealizado ? 'ultimo-realizado' : ''}>
-                  <td>
+                <tr key={`${r.metric_date}-${r.isRealizado ? 'r' : 'p'}`} className={trClassName}>
+                  <td className="col-tipo">
                     {r.isRealizado ? (
                       <span className="badge realizado">Realizado</span>
                     ) : (
-                      <span className="badge projecao">Projeção</span>
+                      <>
+                        <span className="badge projecao">Projeção</span>
+                        {isEstouroLinha && <span className="badge estouro-linha">Estouro</span>}
+                      </>
                     )}
                   </td>
-                  <td>{formatMesCurto(r.metric_date)}</td>
+                  <td className="col-mes">{formatMesCurto(r.metric_date)}</td>
                   <td className="num">{r.orcamento_total != null ? formatMoney(r.orcamento_total) : '—'}</td>
-                  <td>{formatPct(r.poc)}</td>
+                  <td className="num">{formatPct(r.poc)}</td>
                   {simuladorLigado ? (
                     <>
                       <td className="num">{r.isRealizado ? formatMoney(r.custo_obra_mes) : formatMoney(baseLinha?.custo_obra_mes ?? r.custo_obra_mes)}</td>
@@ -402,6 +469,10 @@ function ProjecaoCult() {
                           />
                         )}
                       </td>
+                      <td className="num">{formatPct((baseLinha?.vgv_pct_mes ?? r.vgv_pct_mes ?? 0))}</td>
+                      <td className="num">{formatPct((r.vgv_pct_mes ?? 0))}</td>
+                      <td className="num">{formatPct((baseLinha?.pct_vendido ?? r.pct_vendido ?? 0))}</td>
+                      <td className="num">{formatPct((r.pct_vendido ?? 0))}</td>
                       <td className="num">{r.isRealizado ? formatMoney(r.despesa_mes) : formatMoney(baseLinha?.despesa_mes ?? r.despesa_mes)}</td>
                       <td className="num">
                         {r.isRealizado ? '—' : (
@@ -431,10 +502,6 @@ function ProjecaoCult() {
                           />
                         )}
                       </td>
-                      <td className="num">{formatPct((baseLinha?.vgv_pct_mes ?? r.vgv_pct_mes ?? 0))}</td>
-                      <td className="num">{formatPct((r.vgv_pct_mes ?? 0))}</td>
-                      <td className="num">{formatPct((baseLinha?.pct_vendido ?? r.pct_vendido ?? 0))}</td>
-                      <td className="num">{formatPct((r.pct_vendido ?? 0))}</td>
                       <td className="num">{formatMoney(baseLinha?.receita_mes ?? r.receita_mes)}</td>
                       <td className="num">{formatMoney(r.receita_mes)}</td>
                       <td className="num">{formatMoney(baseLinha?.custo_rec_mes ?? 0)}</td>
@@ -450,9 +517,9 @@ function ProjecaoCult() {
                     <>
                       <td className="num">{formatMoney(r.custo_obra_mes)}</td>
                       <td className="num">{formatMoney(r.vgv_mes)}</td>
-                      <td className="num">{formatMoney(r.despesa_mes)}</td>
                       <td className="num">{formatPct(r.vgv_pct_mes ?? 0)}</td>
                       <td className="num">{formatPct(r.pct_vendido ?? 0)}</td>
+                      <td className="num">{formatMoney(r.despesa_mes)}</td>
                       <td className="num">{formatMoney(r.receita_mes)}</td>
                       <td className="num">{formatMoney(r.custo_rec_mes ?? 0)}</td>
                       <td className={`num ${r.resultado_mes >= 0 ? 'positivo' : 'negativo'}`}>

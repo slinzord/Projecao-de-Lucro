@@ -7,11 +7,88 @@ import pyodbc
 import pandas as pd
 from typing import Any
 from datetime import date
+import os
+import time
+import threading
 
 # IDs do empreendimento Cult (default)
 MLI_ID = 713
 ETAPA_ID = "0028-1"
 PROJECT_ID = 2579
+
+_CACHE_TTL_SECONDS = int(os.getenv("DBX_PROJECTION_CACHE_TTL_SECONDS", "900"))  # 15 min default
+
+
+class _CacheEntry:
+    __slots__ = ("mli", "d2", "loaded_at")
+
+    def __init__(self, mli: pd.DataFrame, d2: pd.DataFrame, loaded_at: float):
+        self.mli = mli
+        self.d2 = d2
+        self.loaded_at = loaded_at
+
+
+_db_cache: dict[tuple[int, str, int], _CacheEntry] = {}
+_db_cache_lock = threading.RLock()
+
+
+def _cache_key(mli_id: int, etapa_id: str, project_id: int) -> tuple[int, str, int]:
+    return (int(mli_id), str(etapa_id), int(project_id))
+
+
+def _cache_is_fresh(entry: _CacheEntry) -> bool:
+    return (time.time() - entry.loaded_at) <= _CACHE_TTL_SECONDS
+
+
+def _get_cached(mli_id: int, etapa_id: str, project_id: int) -> _CacheEntry | None:
+    key = _cache_key(mli_id, etapa_id, project_id)
+    with _db_cache_lock:
+        return _db_cache.get(key)
+
+
+def _set_cached(mli_id: int, etapa_id: str, project_id: int, mli: pd.DataFrame, d2: pd.DataFrame) -> None:
+    key = _cache_key(mli_id, etapa_id, project_id)
+    with _db_cache_lock:
+        _db_cache[key] = _CacheEntry(mli=mli, d2=d2, loaded_at=time.time())
+
+
+def _load_mli_and_d2(
+    mli_id: int,
+    etapa_id: str,
+    project_id: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Carrega MLI e D2 do Databricks.
+    Observação: DataFrames retornam com dtypes ajustados (datetime).
+    """
+    conn = pyodbc.connect("DSN=DatabricksTrinus", autocommit=True)
+
+    try:
+        sql_mli = f"""
+        SELECT *
+        FROM sandbox.tgcore_mesa_equity.mli_etapa
+        WHERE mli_id = {mli_id}
+          AND etapa_id = '{etapa_id}'
+        ORDER BY metric_date
+        """
+        mli = pd.read_sql(sql_mli, conn)
+        if mli.empty:
+            raise ValueError("MLI retornou vazio")
+        mli["metric_date"] = pd.to_datetime(mli["metric_date"])
+
+        sql_d2 = f"""
+        SELECT *
+        FROM gold_tgcore.equity.d2_projeto_hist
+        WHERE project_id = {project_id}
+        ORDER BY reference_date, metric_date
+        """
+        d2 = pd.read_sql(sql_d2, conn)
+        d2["metric_date"] = pd.to_datetime(d2["metric_date"])
+        d2["reference_date"] = pd.to_datetime(d2["reference_date"])
+    finally:
+        conn.close()
+
+    return mli, d2
 
 
 def _fallback_response() -> dict[str, Any]:
@@ -50,45 +127,21 @@ def get_projecao_cult(
     Datas em ISO (YYYY-MM-DD); números como float.
     Se Databricks falhar ou retornar vazio, retorna dados em branco (modo_demonstracao=True).
     """
-    try:
-        conn = pyodbc.connect("DSN=DatabricksTrinus", autocommit=True)
-    except Exception:
-        return _fallback_response()
-
-    try:
-        sql_mli = f"""
-        SELECT *
-        FROM sandbox.tgcore_mesa_equity.mli_etapa
-        WHERE mli_id = {mli_id}
-          AND etapa_id = '{etapa_id}'
-        ORDER BY metric_date
-        """
-        mli = pd.read_sql(sql_mli, conn)
-        if mli.empty:
-            conn.close()
-            return _fallback_response()
-        mli["metric_date"] = pd.to_datetime(mli["metric_date"])
-    except Exception:
+    cached = _get_cached(mli_id, etapa_id, project_id)
+    if cached is not None and _cache_is_fresh(cached):
+        mli = cached.mli
+        d2 = cached.d2
+    else:
         try:
-            conn.close()
+            mli, d2 = _load_mli_and_d2(mli_id=mli_id, etapa_id=etapa_id, project_id=project_id)
+            _set_cached(mli_id=mli_id, etapa_id=etapa_id, project_id=project_id, mli=mli, d2=d2)
         except Exception:
-            pass
-        return _fallback_response()
-
-    try:
-        sql_d2 = f"""
-        SELECT *
-        FROM gold_tgcore.equity.d2_projeto_hist
-        WHERE project_id = {project_id}
-        ORDER BY reference_date, metric_date
-        """
-        d2 = pd.read_sql(sql_d2, conn)
-        d2["metric_date"] = pd.to_datetime(d2["metric_date"])
-        d2["reference_date"] = pd.to_datetime(d2["reference_date"])
-    except Exception:
-        conn.close()
-        return _fallback_response()
-    conn.close()
+            # Fallback: se Databricks falhou mas já temos dados em cache, reaproveita
+            if cached is not None:
+                mli = cached.mli
+                d2 = cached.d2
+            else:
+                return _fallback_response()
 
     mli_sorted = mli.sort_values("metric_date").reset_index(drop=True)
     n_mli = len(mli_sorted)
