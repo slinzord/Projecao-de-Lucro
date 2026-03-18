@@ -104,6 +104,18 @@ def get_projecao_cult(
     poc_anterior = float(ultimo_mli["mli_poc_ponderado"])
     receita_ja_apropriada = float(ultimo_mli["receita_poc_total"])
 
+    def row_get_float(row: pd.Series, *keys: str, default: float = 0.0) -> float:
+        for k in keys:
+            if k in row.index:
+                v = row[k]
+                if pd.isna(v):
+                    continue
+                return float(v)
+        return default
+
+    # Permuta total reconhecida por destravamento conforme evolução do POC
+    permuta_total = row_get_float(ultimo_mli, "valor_permuta_total", "mli_valor_total_permuta", "valor_permuta", default=0.0)
+
     # Saldo restante no MLI = quanto ainda "sobra" de orçamento para gastar (visão MLI)
     saldo_restante_mli = orcamento_total - custo_acumulado
 
@@ -117,10 +129,32 @@ def get_projecao_cult(
         "saldo_restante_mli": round(saldo_restante_mli, 2),
     }
 
+    # =====================================================================================
+    # Terrain e % vendido (VGV) para aproximar o mesmo princípio do MLI/PDF
+    # =====================================================================================
+    ref_max = d2["reference_date"].max()
+    d2_ref = d2[d2["reference_date"] == ref_max].sort_values("metric_date")
+    vgv_total_d2 = float(d2_ref["pure_gsv"].fillna(0).sum())
+
+    def vgv_acum_until(mes_dt: Any) -> float:
+        """Soma pure_gsv acumulada na D2 até (inclusive) a data do mês."""
+        return float(d2_ref.loc[d2_ref["metric_date"] <= mes_dt, "pure_gsv"].fillna(0).sum())
+
+    # Terreno usado na memória do MLI para POC e apropriação não está nas colunas "custo/orçamento".
+    # Inferimos o terreno implícito para fazer o POC base casar com o MLI.
+    terreno_inferido = 0.0
+    if abs(1.0 - poc_anterior) > 1e-9:
+        terreno_inferido = (poc_anterior * orcamento_total - custo_acumulado) / (1.0 - poc_anterior)
+    if terreno_inferido < 0 and "land_costs" in d2_ref.columns:
+        terreno_inferido = float(d2_ref["land_costs"].fillna(0).sum())
+    terreno_total = max(0.0, float(terreno_inferido))
+
     # Realizado: série histórica do MLI (mesmo formato da projeção para a tabela)
     mli_sorted = mli.sort_values("metric_date")
     realizado = []
     receita_poc_anterior = 0.0
+    poc_anterior_mli = 0.0
+    custo_aprop_prev_acum = 0.0
     for _, row in mli_sorted.iterrows():
         dt = row["metric_date"]
         receita_poc = float(row["receita_poc_total"])
@@ -131,9 +165,15 @@ def get_projecao_cult(
         poc = float(row["mli_poc_ponderado"])
         custo_acum = float(row["custo_acumulado_total"])
         orc_mes = float(row["orcamento_total"]) if pd.notna(row.get("orcamento_total")) else orcamento_total
-        # No realizado, usamos custo do próprio MLI como custo reconhecido (até termos % vendido histórico no MLI)
-        custo_rec_mes = custo_mes
-        resultado_mes = receita_mes - custo_rec_mes
+        # Custo reconhecido no mês: delta de custo apropriado acumulado (mesma ideia de "+ LAG mensal")
+        pct_vendido_acum = (vgv_acum_until(dt) / vgv_total_d2) if vgv_total_d2 else 0.0
+        custo_aprop_acum = (custo_acum + terreno_total) * pct_vendido_acum
+        custo_rec_mes = custo_aprop_acum - custo_aprop_prev_acum
+        custo_aprop_prev_acum = custo_aprop_acum
+        # Permuta entra na receita por evolução do POC (delta de POC no mês)
+        delta_poc_mli = poc - poc_anterior_mli
+        receita_permuta_mes = permuta_total * delta_poc_mli
+        resultado_mes = (receita_mes + receita_permuta_mes) - custo_rec_mes
         realizado.append({
             "metric_date": dt.strftime("%Y-%m-%d"),
             "orcamento_total": round(orc_mes, 2),
@@ -142,15 +182,21 @@ def get_projecao_cult(
             "custo_rec_mes": round(custo_rec_mes, 2),
             "vgv_mes": 0.0,
             "despesa_mes": 0.0,
-            "receita_mes": round(receita_mes, 2),
+            "receita_mes": round(receita_mes + receita_permuta_mes, 2),
             "resultado_mes": round(resultado_mes, 2),
             "custo_acum": round(custo_acum, 2),
-            "receita_acum": round(receita_poc, 2),
+            # Receita acumulada = contrato apropriado (receita_poc_total) + permuta destravada pelo POC
+            "receita_acum": round(receita_poc + permuta_total * poc, 2),
         })
+        poc_anterior_mli = poc
 
     ref_max = d2["reference_date"].max()
-    serie_d2 = d2[d2["reference_date"] == ref_max].sort_values("metric_date")
-    serie_d2 = serie_d2[serie_d2["metric_date"] > data_base].head(meses_futuros)
+    serie_d2_full = d2[d2["reference_date"] == ref_max].sort_values("metric_date")
+
+    # D2 (pure_gsv) é a fonte exclusiva do % vendido
+    vgv_acum_base_d2 = float(serie_d2_full.loc[serie_d2_full["metric_date"] <= data_base, "pure_gsv"].fillna(0).sum())
+
+    serie_d2 = serie_d2_full[serie_d2_full["metric_date"] > data_base].head(meses_futuros)
 
     if serie_d2.empty:
         return {
@@ -208,22 +254,21 @@ def get_projecao_cult(
     for _, row in serie_d2.iterrows():
         restante_d2 += get_custo_obra(row["metric_date"], row)
 
-    # VGV total (para % vendido): contrato atual (MLI) + soma do VGV futuro (D2/simulado)
-    vgv_futuro_total = 0.0
-    for _, row in serie_d2.iterrows():
-        vgv_futuro_total += float(get_vgv(row["metric_date"], row))
-    vgv_total = float(receita_contratada_total + vgv_futuro_total)
+    # VGV total (para % vendido): D2 (pure_gsv total do horizonte do reference_date)
+    vgv_total = float(vgv_total_d2)
 
     saldo_restante_mli = orcamento_total - custo_acumulado
     estouro_obra = max(0.0, restante_d2 - saldo_restante_mli)
-    custo_total_projetado = custo_acumulado + restante_d2
+    custo_total_projetado = custo_acumulado + restante_d2 + terreno_total
 
     projecao = []
     custo_acum_proj = custo_acumulado
-    receita_acum_proj = receita_ja_apropriada
+    # Receita acumulada no base inclui permuta destravada pelo POC do base
+    receita_acum_proj = receita_ja_apropriada + permuta_total * poc_anterior
     receita_contratada_proj = receita_contratada_total
-    vgv_acum = receita_contratada_total
+    vgv_acum = vgv_acum_base_d2
     pct_vendido_anterior = (vgv_acum / vgv_total) if vgv_total else 0.0
+    custo_aprop_prev_acum_proj = (custo_acumulado + terreno_total) * pct_vendido_anterior
     orcamento_efetivo = orcamento_total
     revisao_ja_aplicada = False
 
@@ -242,13 +287,21 @@ def get_projecao_cult(
             orcamento_efetivo = orcamento_total + estouro_obra
             revisao_ja_aplicada = True
 
-        poc_atual = min((custo_acum_proj / orcamento_efetivo) if orcamento_efetivo else 0, 1.0)
-        receita_mes = (poc_atual - poc_anterior) * receita_contratada_proj
+        # POC com terreno: (custo incorrido acumulado + terreno) / (orcamento + terreno)
+        poc_atual = min(
+            ((custo_acum_proj + terreno_total) / (orcamento_efetivo + terreno_total)) if (orcamento_efetivo + terreno_total) else 0,
+            1.0,
+        )
+        delta_poc = poc_atual - poc_anterior
+        # Receita mês = delta_poc * (contrato + permuta + VGV futuro via receita_contratada_proj)
+        receita_mes = delta_poc * (receita_contratada_proj + permuta_total)
         receita_acum_proj += receita_mes
         pct_vendido_atual = (vgv_acum / vgv_total) if vgv_total else 0.0
-        # Custo reconhecido via % vendido (fração ideal terreno vendida) sobre o custo total estimado
-        custo_rec_mes = (pct_vendido_atual - pct_vendido_anterior) * orcamento_efetivo
-        custo_rec_mes = max(0.0, float(custo_rec_mes))
+
+        # Custo reconhecido no mês via "+ LAG": delta do custo apropriado acumulado
+        custo_aprop_acum_atual = (custo_acum_proj + terreno_total) * pct_vendido_atual
+        custo_rec_mes = custo_aprop_acum_atual - custo_aprop_prev_acum_proj
+        custo_aprop_prev_acum_proj = custo_aprop_acum_atual
         resultado_mes = receita_mes - custo_rec_mes - despesa_mes
 
         projecao.append({
@@ -272,13 +325,7 @@ def get_projecao_cult(
         pct_vendido_anterior = pct_vendido_atual
 
     # Enriquecer histórico realizado com métricas comerciais (aprox. constante no passado)
-    pct_vendido_base = (receita_contratada_total / vgv_total) if vgv_total else 0.0
-    for r in realizado:
-        r["vgv_acum"] = round(receita_contratada_total, 2)
-        r["vgv_total"] = round(vgv_total, 2)
-        r["vgv_pct_mes"] = 0.0
-        r["pct_vendido"] = round(pct_vendido_base, 8)
-        r["custo_rec_mes"] = r.get("custo_rec_mes", r.get("custo_obra_mes", 0.0))
+    # realizado já vem com custo_rec_mes calculado; o resto de métricas comerciais pode ser enriquecido depois
 
     return {
         "base": base,
